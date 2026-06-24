@@ -1,65 +1,120 @@
-import Image from "next/image";
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useSSE } from '@/hooks/useSSE';
+import { usePlan } from '@/hooks/usePlan';
+import type { DashboardData } from '@/lib/types';
+import Header from '@/components/Header';
+import CurrentChat from '@/components/CurrentChat';
+import UsageLimitsCard from '@/components/UsageLimits';
+import AllChats from '@/components/AllChats';
+import HourlyBreakdown from '@/components/HourlyBreakdown';
+import RecentRequests from '@/components/RecentRequests';
+import PromptHealth from '@/components/PromptHealth';
+
+type Tab = 'dashboard' | 'activity' | 'health';
+type Theme = 'light' | 'dark';
 
 export default function Home() {
+  const { data, connected } = useSSE<DashboardData>(`/api/stream`);
+  const { monthlyUsd, setPlan, subValue } = usePlan();
+  const [tab, setTab] = useState<Tab>('dashboard');
+  const [theme, setTheme] = useState<Theme>('light');
+
+  useEffect(() => {
+    const stored = localStorage.getItem('theme') as Theme | null;
+    if (stored === 'dark' || stored === 'light') setTheme(stored);
+  }, []);
+
+  const toggleTheme = () => setTheme(t => {
+    const next = t === 'light' ? 'dark' : 'light';
+    localStorage.setItem('theme', next);
+    return next;
+  });
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <div
+      data-theme={theme}
+      style={{ minHeight: '100vh', background: 'var(--color-canvas-soft)' }}
+    >
+      <Header
+        data={data}
+        connected={connected}
+        monthlyUsd={monthlyUsd}
+        onSetPlan={setPlan}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+      />
+
+      {/* Tab bar */}
+      <div style={{
+        position: 'sticky',
+        top: 59,
+        zIndex: 40,
+        background: 'var(--color-canvas)',
+        borderBottom: '1px solid var(--color-hairline)',
+        padding: '0 24px',
+        display: 'flex',
+      }}>
+        {([
+          { id: 'dashboard', label: 'Dashboard' },
+          { id: 'activity',  label: 'Activity' },
+          { id: 'health',    label: 'Prompt Health' },
+        ] as { id: Tab; label: string }[]).map(({ id, label }) => (
+          <button
+            key={id}
+            onClick={() => setTab(id)}
+            style={{
+              height: 40,
+              padding: '0 12px',
+              background: 'transparent',
+              border: 'none',
+              borderBottom: `2px solid ${tab === id ? 'var(--color-ink)' : 'transparent'}`,
+              fontFamily: 'var(--f-sans)',
+              fontSize: 14,
+              fontWeight: 500,
+              color: tab === id ? 'var(--color-ink)' : 'var(--color-body)',
+              cursor: 'pointer',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {data === null ? (
+        <main style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
+          <p style={{ fontFamily: 'var(--f-mono)', fontSize: 13, color: 'var(--color-mute)' }}>
+            connecting to backend…
           </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+        </main>
+      ) : tab === 'dashboard' ? (
+        <main style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <CurrentChat
+            chat={data.currentChat}
+            subValue={subValue(
+              data.usageLimits?.sessionPct ?? null,
+              data.currentChat?.reqCount ?? 0,
+              data.currentChat?.cost ?? 0,
+              data.totalCost,
+            )}
+            monthlyUsd={monthlyUsd}
+          />
+          <RecentRequests requests={data.recent} />
+        </main>
+      ) : tab === 'activity' ? (
+        <main style={{ padding: 24, display: 'grid', gridTemplateColumns: '300px 1fr', gap: 16, alignItems: 'start' }}>
+          <UsageLimitsCard limits={data.usageLimits} />
+          <AllChats chats={data.allChats} />
+          <div style={{ gridColumn: '1 / span 2' }}>
+            <HourlyBreakdown hourly={data.hourly} />
+          </div>
+        </main>
+      ) : (
+        <main style={{ padding: 24 }}>
+          <PromptHealth data={data.promptHealth} />
+        </main>
+      )}
     </div>
   );
 }
