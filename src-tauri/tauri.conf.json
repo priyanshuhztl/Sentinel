@@ -1,0 +1,32 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Sentinel",
+  "version": "0.1.0",
+  "identifier": "com.sentinel.app",
+  "build": {
+    "frontendDist": null,
+    "devUrl": null,
+    "beforeDevCommand": { "script": "npm run build:standalone", "wait": true },
+    "beforeBuildCommand": "npm run build:standalone"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../.next/standalone": "standalone"
+    }
+  }
+}
