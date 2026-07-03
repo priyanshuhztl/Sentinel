@@ -5,10 +5,6 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import https from 'https';
 
-const ELECTRON_CONFIG = path.join(
-  os.homedir(),
-  'Library/Application Support/Claude/config.json'
-);
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 export interface UsageLimits {
@@ -35,9 +31,32 @@ if (!g._twCached) {
   };
 }
 
-// ─── Electron cookie/config decryption ───────────────────────────────────────
+// ─── Platform-specific paths ──────────────────────────────────────────────────
 
-function getSafeStorageKey(): string | null {
+function getConfigPath(): string {
+  switch (process.platform) {
+    case 'win32':
+      return path.join(
+        process.env['APPDATA'] ?? path.join(os.homedir(), 'AppData', 'Roaming'),
+        'Claude', 'config.json'
+      );
+    case 'linux':
+      return path.join(os.homedir(), '.config', 'Claude', 'config.json');
+    default: // darwin
+      return path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'config.json');
+  }
+}
+
+function getLocalStatePath(): string {
+  return path.join(
+    process.env['APPDATA'] ?? path.join(os.homedir(), 'AppData', 'Roaming'),
+    'Claude', 'Local State'
+  );
+}
+
+// ─── Key retrieval ────────────────────────────────────────────────────────────
+
+function getSafeStorageKeyMac(): string | null {
   try {
     return execSync(
       'security find-generic-password -s "Claude Safe Storage" -w',
@@ -46,38 +65,124 @@ function getSafeStorageKey(): string | null {
   } catch { return null; }
 }
 
-function decryptElectronValue(encrypted: string): string | null {
-  const key = getSafeStorageKey();
-  if (!key) return null;
+function getSafeStorageKeyLinux(): string {
+  try {
+    const result = execSync(
+      'secret-tool lookup application "Claude Safe Storage"',
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }
+    ).toString().trim();
+    if (result) return result;
+  } catch { /* fall through to default */ }
+  // Chrome/Electron Linux fallback when no secret service is available
+  return 'peanuts';
+}
 
+// ─── Decryption ───────────────────────────────────────────────────────────────
+
+// macOS (1003 iterations) + Linux (1 iteration): PBKDF2-SHA1 + AES-128-CBC
+function decryptV10CBC(encrypted: string, passphrase: string, iterations: number): string | null {
   try {
     const raw = Buffer.from(encrypted, 'base64');
     if (raw.slice(0, 3).toString() !== 'v10') return null;
-    const body = raw.slice(3);
 
-    // PBKDF2-SHA1 key derivation (Chrome macOS algorithm)
-    const aesKey = crypto.pbkdf2Sync(key, 'saltysalt', 1003, 16, 'sha1');
+    const aesKey = crypto.pbkdf2Sync(passphrase, 'saltysalt', iterations, 16, 'sha1');
     const iv     = Buffer.alloc(16, 0x20); // 16 space characters
 
     const decipher = crypto.createDecipheriv('aes-128-cbc', aesKey, iv);
     decipher.setAutoPadding(false);
-    const decrypted = Buffer.concat([decipher.update(body), decipher.final()]);
+    const decrypted = Buffer.concat([decipher.update(raw.slice(3)), decipher.final()]);
 
-    // Remove PKCS7 padding
     const pad = decrypted[decrypted.length - 1];
     const text = (pad >= 1 && pad <= 16)
       ? decrypted.slice(0, -pad).toString('utf8')
       : decrypted.toString('utf8');
 
-    // Strip binary prefix (find JSON start)
     const jsonStart = text.indexOf('{');
     return jsonStart >= 0 ? text.slice(jsonStart) : text;
   } catch { return null; }
 }
 
+// Windows newer Electron: DPAPI-wrapped AES-256-GCM key stored in Local State
+function decryptWindowsV10GCM(raw: Buffer): string | null {
+  try {
+    const localStatePath = getLocalStatePath();
+    if (!fs.existsSync(localStatePath)) return null;
+
+    const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8')) as Record<string, unknown>;
+    const encryptedKeyB64 = (localState?.['os_crypt'] as Record<string, string> | undefined)?.['encrypted_key'];
+    if (!encryptedKeyB64) return null;
+
+    // Key is base64-encoded with a 5-byte 'DPAPI' ASCII prefix — strip it, then DPAPI-decrypt
+    const encryptedKey = Buffer.from(encryptedKeyB64, 'base64').slice(5).toString('base64');
+    const aesKeyB64 = execSync(
+      `powershell -NoProfile -Command "$b=[System.Convert]::FromBase64String('${encryptedKey}');$k=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[System.Convert]::ToBase64String($k)"`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString().trim();
+
+    const aesKey     = Buffer.from(aesKeyB64, 'base64');
+    const nonce      = raw.slice(3, 15);   // 12-byte nonce after 'v10'
+    const ciphertext = raw.slice(15, -16);
+    const authTag    = raw.slice(-16);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, nonce);
+    decipher.setAuthTag(authTag);
+    const text = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+
+    const jsonStart = text.indexOf('{');
+    return jsonStart >= 0 ? text.slice(jsonStart) : text;
+  } catch { return null; }
+}
+
+// Windows older Electron: direct DPAPI, no v10 prefix
+function decryptWindowsDPAPI(raw: Buffer): string | null {
+  try {
+    const b64 = raw.toString('base64');
+    const result = execSync(
+      `powershell -NoProfile -Command "$b=[System.Convert]::FromBase64String('${b64}');$d=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[System.Text.Encoding]::UTF8.GetString($d)"`,
+      { stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString().trim();
+
+    const jsonStart = result.indexOf('{');
+    return jsonStart >= 0 ? result.slice(jsonStart) : result;
+  } catch { return null; }
+}
+
+function decryptElectronValue(encrypted: string): string | null {
+  switch (process.platform) {
+    case 'darwin': {
+      const key = getSafeStorageKeyMac();
+      if (!key) return null;
+      return decryptV10CBC(encrypted, key, 1003);
+    }
+    case 'linux': {
+      const key = getSafeStorageKeyLinux();
+      // Try decrypting as v10 CBC (libsecret or peanuts key, 1 iteration on Linux)
+      const result = decryptV10CBC(encrypted, key, 1);
+      if (result) return result;
+      // Fallback: some Linux Electron builds store the value as plaintext JSON
+      try {
+        const raw = Buffer.from(encrypted, 'base64').toString('utf8');
+        const jsonStart = raw.indexOf('{');
+        return jsonStart >= 0 ? raw.slice(jsonStart) : null;
+      } catch { return null; }
+    }
+    case 'win32': {
+      const raw = Buffer.from(encrypted, 'base64');
+      if (raw.slice(0, 3).toString() === 'v10') {
+        return decryptWindowsV10GCM(raw);
+      }
+      return decryptWindowsDPAPI(raw);
+    }
+    default:
+      return null;
+  }
+}
+
+// ─── Token extraction ─────────────────────────────────────────────────────────
+
 function getAccessToken(): string | null {
   try {
-    const cfg = JSON.parse(fs.readFileSync(ELECTRON_CONFIG, 'utf8'));
+    const cfg = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8'));
     const tokenB64 = cfg['oauth:tokenCache'];
     if (!tokenB64) return null;
 
@@ -147,7 +252,6 @@ async function fetchFromAPI(): Promise<UsageLimits> {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export function getUsageLimits(): UsageLimits {
-  // Lazy-start in case instrumentation.ts didn't fire (e.g. dev HMR re-register skip)
   if (!g._twPollerStarted) startUsagePoller();
   return g._twCached!;
 }
@@ -155,21 +259,19 @@ export function getUsageLimits(): UsageLimits {
 export function startUsagePoller(): void {
   if (g._twPollerStarted) return;
   g._twPollerStarted = true;
-  if (!fs.existsSync(ELECTRON_CONFIG)) return;
+  if (!fs.existsSync(getConfigPath())) return;
 
   const poll = async () => {
     try {
       const result = await fetchFromAPI();
-      // Only replace cache if we got real data (not a rate-limit-preserved value)
       if (result.error !== 'rate-limited' || g._twCached!.fetchedAt === 0) {
         g._twCached = result;
-        // Notify SSE clients of updated limits
         const { emitter } = await import('./events');
         emitter.emit('update');
       }
     } catch { /* swallow — next interval will retry */ }
   };
 
-  poll(); // fetch immediately at startup
+  poll();
   setInterval(poll, POLL_INTERVAL_MS);
 }
