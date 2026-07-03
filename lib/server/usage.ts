@@ -102,23 +102,41 @@ function decryptV10CBC(encrypted: string, passphrase: string, iterations: number
   } catch { return null; }
 }
 
-// Windows newer Electron: DPAPI-wrapped AES-256-GCM key stored in Local State
-function decryptWindowsV10GCM(raw: Buffer): string | null {
+// Windows newer Electron: DPAPI-wrapped AES-256-GCM key stored in Local State.
+// Each step throws a distinct message — same reasoning as getAccessToken(),
+// this is the only diagnostic surface available on a machine we can't log into.
+function decryptWindowsV10GCM(raw: Buffer): string {
+  const localStatePath = getLocalStatePath();
+  if (!fs.existsSync(localStatePath)) {
+    throw new Error(`Local State file not found at ${localStatePath}`);
+  }
+
+  let localState: Record<string, unknown>;
   try {
-    const localStatePath = getLocalStatePath();
-    if (!fs.existsSync(localStatePath)) return null;
+    localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8'));
+  } catch (err) {
+    throw new Error(`Local State at ${localStatePath} is not valid JSON: ${err}`);
+  }
 
-    const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8')) as Record<string, unknown>;
-    const encryptedKeyB64 = (localState?.['os_crypt'] as Record<string, string> | undefined)?.['encrypted_key'];
-    if (!encryptedKeyB64) return null;
+  const encryptedKeyB64 = (localState?.['os_crypt'] as Record<string, string> | undefined)?.['encrypted_key'];
+  if (!encryptedKeyB64) {
+    throw new Error(`os_crypt.encrypted_key missing from Local State at ${localStatePath}`);
+  }
 
-    // Key is base64-encoded with a 5-byte 'DPAPI' ASCII prefix — strip it, then DPAPI-decrypt
-    const encryptedKey = Buffer.from(encryptedKeyB64, 'base64').slice(5).toString('base64');
-    const aesKeyB64 = execSync(
+  // Key is base64-encoded with a 5-byte 'DPAPI' ASCII prefix — strip it, then DPAPI-decrypt
+  const encryptedKey = Buffer.from(encryptedKeyB64, 'base64').slice(5).toString('base64');
+  let aesKeyB64: string;
+  try {
+    aesKeyB64 = execSync(
       `powershell -NoProfile -Command "$b=[System.Convert]::FromBase64String('${encryptedKey}');$k=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[System.Convert]::ToBase64String($k)"`,
-      { stdio: ['ignore', 'pipe', 'ignore'] }
+      { stdio: ['ignore', 'pipe', 'pipe'] }
     ).toString().trim();
+  } catch (err) {
+    throw new Error(`DPAPI unwrap of encrypted_key via PowerShell failed: ${err}`);
+  }
+  if (!aesKeyB64) throw new Error('PowerShell DPAPI unwrap of encrypted_key returned empty output');
 
+  try {
     const aesKey     = Buffer.from(aesKeyB64, 'base64');
     const nonce      = raw.slice(3, 15);   // 12-byte nonce after 'v10'
     const ciphertext = raw.slice(15, -16);
@@ -130,21 +148,26 @@ function decryptWindowsV10GCM(raw: Buffer): string | null {
 
     const jsonStart = text.indexOf('{');
     return jsonStart >= 0 ? text.slice(jsonStart) : text;
-  } catch { return null; }
+  } catch (err) {
+    throw new Error(`AES-256-GCM decrypt of oauth:tokenCache failed: ${err}`);
+  }
 }
 
 // Windows older Electron: direct DPAPI, no v10 prefix
-function decryptWindowsDPAPI(raw: Buffer): string | null {
+function decryptWindowsDPAPI(raw: Buffer): string {
+  const b64 = raw.toString('base64');
+  let result: string;
   try {
-    const b64 = raw.toString('base64');
-    const result = execSync(
+    result = execSync(
       `powershell -NoProfile -Command "$b=[System.Convert]::FromBase64String('${b64}');$d=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);[System.Text.Encoding]::UTF8.GetString($d)"`,
-      { stdio: ['ignore', 'pipe', 'ignore'] }
+      { stdio: ['ignore', 'pipe', 'pipe'] }
     ).toString().trim();
+  } catch (err) {
+    throw new Error(`Direct DPAPI unwrap via PowerShell failed: ${err}`);
+  }
 
-    const jsonStart = result.indexOf('{');
-    return jsonStart >= 0 ? result.slice(jsonStart) : result;
-  } catch { return null; }
+  const jsonStart = result.indexOf('{');
+  return jsonStart >= 0 ? result.slice(jsonStart) : result;
 }
 
 function decryptElectronValue(encrypted: string): string | null {
