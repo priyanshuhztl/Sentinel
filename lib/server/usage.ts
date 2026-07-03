@@ -180,19 +180,35 @@ function decryptElectronValue(encrypted: string): string | null {
 
 // ─── Token extraction ─────────────────────────────────────────────────────────
 
-function getAccessToken(): string | null {
+// Throws a specific, user-visible reason at each step instead of collapsing
+// every failure into one generic message — the reason ends up directly in
+// the Usage Limits card, since that's the only diagnostic surface available
+// once this is running inside a packaged app with no visible console.
+function getAccessToken(): string {
+  const configPath = getConfigPath();
+  let cfg: Record<string, unknown>;
   try {
-    const cfg = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8'));
-    const tokenB64 = cfg['oauth:tokenCache'];
-    if (!tokenB64) return null;
+    cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (err) {
+    throw new Error(`Can't read/parse Claude config at ${configPath}: ${err}`);
+  }
 
-    const json = decryptElectronValue(tokenB64);
-    if (!json) return null;
+  const tokenB64 = cfg['oauth:tokenCache'] as string | undefined;
+  if (!tokenB64) throw new Error(`oauth:tokenCache missing from ${configPath}`);
 
-    const cache = JSON.parse(json) as Record<string, { token: string; subscriptionType?: string }>;
-    const entry = Object.values(cache)[0];
-    return entry?.token ?? null;
-  } catch { return null; }
+  const json = decryptElectronValue(tokenB64);
+  if (!json) throw new Error(`Failed to decrypt oauth:tokenCache (platform: ${process.platform})`);
+
+  let cache: Record<string, { token: string; subscriptionType?: string }>;
+  try {
+    cache = JSON.parse(json);
+  } catch {
+    throw new Error('Decrypted oauth:tokenCache is not valid JSON');
+  }
+
+  const entry = Object.values(cache)[0];
+  if (!entry?.token) throw new Error('Decrypted oauth:tokenCache has no token entries');
+  return entry.token;
 }
 
 // ─── API call ─────────────────────────────────────────────────────────────────
@@ -217,9 +233,11 @@ function httpsGet(url: string, headers: Record<string, string>): Promise<unknown
 }
 
 async function fetchFromAPI(): Promise<UsageLimits> {
-  const token = getAccessToken();
-  if (!token) {
-    return { ...g._twCached!, fetchedAt: Date.now(), error: 'OAuth token not found' };
+  let token: string;
+  try {
+    token = getAccessToken();
+  } catch (err) {
+    return { ...g._twCached!, fetchedAt: Date.now(), error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
